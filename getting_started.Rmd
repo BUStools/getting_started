@@ -1,0 +1,152 @@
+---
+title: "Getting started"
+author: "Lambda"
+date: "6/15/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      fig.align = "center")
+```
+
+In thihs notebook, we load the output of `bustools` and do some basic analysis with R.
+```{r, message=FALSE}
+library(Seurat)
+library(DropletUtils)
+library(Matrix)
+library(data.table)
+library(ggplot2)
+library(magrittr)
+fn <- "/home/single_cell_analysis/kallisto_out_single/kallisto_SRR8599150_v2/"
+```
+
+Here's a function that can load the output into R in one step. This is part of the `BUSpaRse` package, which implement utility functions related to `bustools`.
+```{r}
+# Function to load matrix
+#' Read matrix along with barcode and gene names
+#' 
+#' This function takes in a directory and name and reads the mtx file, genes,
+#' and barcodes from the output of `bustools` to return a sparse matrix with 
+#' column names and row names. 
+#' 
+#' @param dir Directory with the bustools count outputs.
+#' @param name The files in the output directory should be <name>.mtx, <name>.genes.txt,
+#' and <name>.barcodes.txt.
+#' @param tcc Logical, whether the matrix of interest is a TCC matrix. Defaults
+#' to \code{FALSE}.
+#' @return A dgCMatrix with barcodes as column names and genes as row names.
+#' 
+read_count_output <- function(dir, name, tcc = TRUE) {
+  dir <- normalizePath(dir, mustWork = TRUE)
+  m <- readMM(paste0(dir, "/", name, ".mtx"))
+  m <- t(m)
+  m <- as(m, "dgCMatrix")
+  # The matrix read has cells in rows
+  ge <- if (tcc) ".ec.txt" else ".genes.txt"
+  genes <- fread(paste0(dir, "/", name, ge), header = FALSE)$V1
+  barcodes <- fread(paste0(dir, "/", name, ".barcodes.txt"), header = FALSE)$V1
+  colnames(m) <- barcodes
+  rownames(m) <- genes
+  return(m)
+}
+```
+
+```{r}
+# The directory where the data is placed
+list.files(fn)
+```
+
+```{r}
+# Load data
+m <- read_count_output(fn, "genes", tcc = FALSE)
+dim(m)
+```
+We expect 3949 cells, but there are way more barcodes (columns) than expected.
+
+# Remove empty droplets
+The vast majority of barcodes we see in the data are empty droplets. We will remove barcodes that are likely to be empty droplets and keep those that are likely to be real cells. Here we use the classic knee plot method to remove empty droplets.
+
+```{r}
+bc_rank <- barcodeRanks(m)
+```
+
+```{r}
+qplot(bc_rank$rank, bc_rank$total, geom = "line") +
+  geom_hline(yintercept = metadata(bc_rank)$knee, color = "blue", linetype = 2) +
+  geom_hline(yintercept = metadata(bc_rank)$inflection, color = "green", linetype = 2) +
+  annotate("text", x = 1000, y = 1.2 * c(metadata(bc_rank)$knee, metadata(bc_rank)$inflection),
+           label = c("knee", "inflection"), color = c("blue", "green")) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "Rank", y = "Total reads") +
+  theme_bw()
+```
+
+Now we filter the barcodes based on the inflectionsn point. We will also remove genes not detected in any cell.
+```{r}
+# Filter the barcodes based on 
+tot_counts <- colSums(m)
+tot_genes <- rowSums(m)
+m_filtered <- m[, tot_counts > metadata(bc_rank)$inflection]
+m_filtered <- m_filtered[tot_genes > 0, ]
+dim(m_filtered)
+```
+
+That's a more reasonable number of barcodes.
+
+# Basic analysis
+First, we normali and scale the data with [`SCTransform`](https://github.com/ChristophH/sctransform).
+
+```{r, message=FALSE, warning=FALSE}
+seu <- CreateSeuratObject(m_filtered) %>% 
+  SCTransform(verbose = FALSE)
+```
+
+Some QC: distribution of total UMI counts and number of genes detected
+```{r}
+VlnPlot(seu, c("nCount_RNA", "nFeature_RNA"), pt.size = 0.1)
+```
+
+Also see how total UMI counts in each cell relates to the number of genes detected.
+```{r}
+ggplot(seu@meta.data, aes(nCount_RNA, nFeature_RNA)) +
+  geom_point(size = 0.5, alpha = 0.3) +
+  theme_bw() +
+  labs(x = "Total UMI counts", y = "Number of genes detected")
+```
+
+Then PCA.
+```{r}
+seu <- RunPCA(seu, npcs = 50, verbose = FALSE)
+ElbowPlot(seu, ndims = 50) + labs(x = "Principal component")
+```
+
+The y axis of this plot is the standard deviation of the data explained by the principal component (PC). Judging from the elbow plot, we will use the first 30 PCs for tSNE.
+
+```{r}
+# Run tSNE
+seu <- RunTSNE(seu, dims = 1:30, verbose = FALSE)
+```
+
+Here we cluster the data with the Louvain algorithm. The algorithm used in Seurat can be changed.
+```{r}
+seu <- FindNeighbors(seu, verbose = FALSE)
+seu <- FindClusters(seu, verbose = FALSE)
+```
+
+What do the clusters look like?
+```{r}
+# On PCA
+DimPlot(seu, pt.size = 0.5, reduction = "pca")
+```
+
+```{r}
+# On tSNE
+DimPlot(seu, pt.size = 0.5, reduction = "tsne")
+```
+
+```{r}
+sessionInfo()
+```
+
